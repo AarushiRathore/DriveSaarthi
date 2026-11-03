@@ -1,8 +1,8 @@
 # DriveSaarthi
-::: {align="center"}
-# Hey, I'm Aarushi 👋
 
-### MCA Student \| Aspiring Data & AI Professional \| Builder of Practical Tech Projects
+# Hey, We are Aarushi and Mansi👋
+
+### MCA Students \| Aspiring Data & AI Professionals \| Builder of Practical Tech Projects
 
 ```{=html}
 <p>
@@ -26,7 +26,7 @@
 -   🎓 Currently pursuing **Master of Computer Applications (MCA)**.
 -   🧠 Interested in **Artificial Intelligence, Data Analytics, Machine
     Learning and practical problem-solving**.
--   🛠️ I learn by building projects, experimenting with tools and
+-   🛠️ we learn by building projects, experimenting with tools and
     improving through feedback.
 -   🌱 Currently strengthening my foundations in Python, data workflows
     and software development.
@@ -131,7 +131,7 @@ detection.
 ```{=html}
 </p>
 ```
-::: {align="center"}
+
 *Thanks for stopping by. Feel free to explore my repositories and follow
 my learning journey.*
-:::
+

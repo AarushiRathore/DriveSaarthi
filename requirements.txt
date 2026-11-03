@@ -1,0 +1,6 @@
+streamlit>=1.50
+opencv-python>=4.9
+mediapipe>=0.10.14   # needs Python 3.9-3.12
+ultralytics>=8.3
+numpy
+pandas

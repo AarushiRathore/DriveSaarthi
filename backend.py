@@ -340,15 +340,15 @@ class MonitorEngine:
             0: "seatbelt_fastened",
                1: "seatbelt_unfastened",
                  }
-          if confidence < 0.65:
+        if confidence < 0.65:
             seatbelt_status = "unknown"
 
-          elif class_name == "seatbelt_fastened":
+        elif class_name == "seatbelt_fastened":
              seatbelt_status = "fastened"
 
-          elif class_name == "seatbelt_unfastened":
+        elif class_name == "seatbelt_unfastened":
              seatbelt_status = "unfastened"
-          else:
+        else:
                 roi = self.overlay.get("roi")
         self._analysed += 1
         votes = list(self.belt_votes)

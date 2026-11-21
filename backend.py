@@ -336,14 +336,19 @@ class MonitorEngine:
                 ear = (_ear(pts, R_EYE) + _ear(pts, L_EYE)) / 2
 
         # seatbelt (heuristic path; the custom model votes from the YOLO thread)
-        if not self.belt_model:
-            if face is None:
-                self.belt_votes.clear()
-            elif self._analysed % 2 == 0:
-                belt, roi = self._belt(frame, face)
-                if belt is not None:
-                    self.belt_votes.append(belt)
-            else:
+        CLASS_NAMES = {
+            0: "seatbelt_fastened",
+               1: "seatbelt_unfastened",
+                 }
+          if confidence < 0.65:
+            seatbelt_status = "unknown"
+
+          elif class_name == "seatbelt_fastened":
+             seatbelt_status = "fastened"
+
+          elif class_name == "seatbelt_unfastened":
+             seatbelt_status = "unfastened"
+          else:
                 roi = self.overlay.get("roi")
         self._analysed += 1
         votes = list(self.belt_votes)

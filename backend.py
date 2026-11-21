@@ -536,7 +536,7 @@ class MonitorEngine:
             return
         self._last_sms = now
         self._speed_notified = self._speed_notified or kind == "alert"
-        self.notifier.send(info["emergency_phone"], kind, vals, cfg.log_dir,
+        self.notifier.send(info["emergency_email"], kind, vals, cfg.log_dir,
                            lambda st: self._log("Speed", f"Emergency contact notified: {st}"))
 
     # ---------- logging ----------

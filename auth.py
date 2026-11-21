@@ -43,7 +43,7 @@ def init_db():
            for row in c.execute("PRAGMA table_info(users)").fetchall()
           }
 
-         if "emergency_email" not in columns:
+     if "emergency_email" not in columns:
            c.execute(
              "ALTER TABLE users ADD COLUMN emergency_email TEXT DEFAULT ''"
            )

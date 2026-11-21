@@ -9,7 +9,7 @@ apply_theme()
 auth.init_db()
 
 if st.session_state.get("user"):
-    pages = [st.Page("frontend2up.py", title="Monitor", icon=":material/shield:", default=True),
+    pages = [st.Page("frontend.py", title="Monitor", icon=":material/shield:", default=True),
              st.Page("profile.py", title="Driver profile", icon=":material/person:")]
     nav = st.navigation(pages)
 else:

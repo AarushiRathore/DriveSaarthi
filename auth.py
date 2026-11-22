@@ -1,4 +1,4 @@
-"""Driver accounts and report index: SQLite, PBKDF2 hashing, lockout after repeated failures."""
+
 from __future__ import annotations
 
 import hashlib
@@ -38,15 +38,7 @@ def _conn():
 def init_db():
     with closing(_conn()) as c:
         c.executescript(SCHEMA)
-        columns = {
-         row["name"]
-           for row in c.execute("PRAGMA table_info(users)").fetchall()
-          }
-
-     if "emergency_email" not in columns:
-           c.execute(
-             "ALTER TABLE users ADD COLUMN emergency_email TEXT DEFAULT ''"
-           )
+   
 
 
 def _hash(pw: str, salt: bytes) -> bytes:

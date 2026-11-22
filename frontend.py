@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
+
 import backend
 from backend import PARAMS, TITLES, MonitorEngine
 
@@ -218,5 +219,5 @@ else:
                 last_slow = now
             if snap["critical_seq"] != last_seq:
                 last_seq = snap["critical_seq"]
-                audio.audio(beep(), format="audio/wav", autoplay=True)
+                audio.audio(beep(), format="audio/wav", autoplay=True, alt=f"Alert beep {last_seq}")
         time.sleep(0.03)

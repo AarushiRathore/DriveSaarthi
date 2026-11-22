@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 import atexit
 import csv
 import os
@@ -14,6 +15,7 @@ import auth
 import reporting
 from notifier import IST, Notifier
 from voice import VoiceAlert, phone_message
+from detectors import FaceLandmarker, YoloModels, belt_from_pose, phones_near_driver
 
 try:
     import mediapipe as mp
@@ -32,6 +34,11 @@ L_EYE = [362, 385, 387, 263, 373, 380]
 BRASS, RED, INK = (90, 151, 184), (63, 69, 210), (236, 232, 223)  # BGR
 BACKEND_VERSION = 4  # bump when Config/engine change so cached engines get rebuilt
 STALE_AFTER = 2.0   # seconds without a new frame before the feed counts as lost
+
+
+def _ear(pts: np.ndarray, idx: list[int]) -> float:
+    p = pts[idx]
+    return float((np.linalg.norm(p[1] - p[5]) + np.linalg.norm(p[2] - p[4])) / (2 * np.linalg.norm(p[0] - p[3]) + 1e-6))
 
 
 @dataclass
@@ -91,7 +98,7 @@ class CameraStream:
             else:
                 fails += 1
                 time.sleep(0.02)
-                if fails > 100:                       # ~2 s of failed reads: reconnect
+                if fails >= 80:                       # ~2 s of failed reads: reconnect
                     self.cap.release()
                     time.sleep(1.0)
                     self.cap, fails = self._open(), 0
@@ -182,7 +189,8 @@ class MonitorEngine:
         self._ui_seq = 0
         self.speed_src = SpeedSource()
         self.window_start = time.time()
-        self.face_mesh = self.yolo = self.belt_model = None
+        self.face_mesh = self.yolo = self.belt_model = self.pose_model = None
+        self.pose_kp = None
         self.models = {"face": False, "phone": False, "seatbelt": "heuristic"}
         self.overlay: dict = {}
         self.phone_boxes: list = []
@@ -202,24 +210,41 @@ class MonitorEngine:
         self._last_sms, self._retry_at = 0.0, 0.0
         atexit.register(lambda: self.running and self.write_report())
 
-    # ---------- lifecycle ----------
+    # lifecycle 
     @property
     def running(self) -> bool:
         return bool(self.threads) and self.threads[0].is_alive()
 
     def _load_models(self):
         try:
-            if mp and not self.face_mesh:
-                self.face_mesh = mp.solutions.face_mesh.FaceMesh(
-                    max_num_faces=1, refine_landmarks=True,
-                    min_detection_confidence=0.5, min_tracking_confidence=0.5)
-            if YOLO and not self.yolo:
-                self.yolo = YOLO("yolov8n.pt")                    # COCO: class 67 = cell phone
-            if YOLO and not self.belt_model and os.path.exists("models/seatbelt.pt"):
-                self.belt_model = YOLO("models/seatbelt.pt")      # optional custom model
+            if not self.face_mesh:
+                try:
+                    fl = FaceLandmarker()
+                    if fl.backend != "none":
+                        self.face_mesh = fl
+                except Exception:
+                    pass
+                if not self.face_mesh and mp and hasattr(mp, "solutions") and hasattr(mp.solutions, "face_mesh"):
+                    self.face_mesh = mp.solutions.face_mesh.FaceMesh(
+                        max_num_faces=1, refine_landmarks=True,
+                        min_detection_confidence=0.5, min_tracking_confidence=0.5)
         except Exception as exc:
-            self.error = f"Model load failed: {exc}"
-        self.models = {"face": self.face_mesh is not None, "phone": self.yolo is not None,
+            self.error = f"Face model load failed: {exc}"
+
+        try:
+            if YOLO and not self.yolo:
+                self.yolo = YOLO("yolov8n.pt")
+            if YOLO and not self.pose_model and os.path.exists("yolov8n-pose.pt"):
+                self.pose_model = YOLO("yolov8n-pose.pt")
+            if YOLO and not self.belt_model and os.path.exists("models/seatbelt.pt"):
+                self.belt_model = YOLO("models/seatbelt.pt")
+        except Exception as exc:
+            self.error = f"YOLO model load failed: {exc}"
+
+        face_ok = False
+        if self.face_mesh:
+            face_ok = getattr(self.face_mesh, "backend", "") != "none" if hasattr(self.face_mesh, "backend") else True
+        self.models = {"face": face_ok, "phone": self.yolo is not None,
                        "seatbelt": "custom model" if self.belt_model else "heuristic"}
 
     def start(self):
@@ -285,23 +310,45 @@ class MonitorEngine:
 
     def _yolo_loop(self, stop: threading.Event):
         seen = -1
+        max_fps = 10
         while not stop.is_set():
             item = self._latest
-            if not item or item[0] == seen or not (self.yolo or self.belt_model):
+            if not item or item[0] == seen or not (self.yolo or self.belt_model or self.pose_model):
                 time.sleep(0.02)
                 continue
             seen, frame, t0 = item[0], item[1], time.time()
             try:
-                if y.pose:
-                    self.pose_kp, self.pose_ts = y.detect_pose(frame), time.time()
-                if y.phone:
-                    boxes = y.detect_phones(frame, self.cfg.phone_conf, self.cfg.yolo_imgsz)
+                if self.yolo:
+                    cfg = self.cfg
+                    results = self.yolo(frame, imgsz=cfg.yolo_imgsz, verbose=False)[0]
+                    boxes = []
+                    for box in results.boxes:
+                        cls = int(box.cls[0])
+                        conf = float(box.conf[0])
+                        # COCO class 67 = cell phone
+                        if cls == 67 and conf >= cfg.phone_conf:
+                            x1, y1, x2, y2 = map(int, box.xyxy[0])
+                            boxes.append([x1, y1, x2, y2])
                     self.phone_boxes = boxes
-                    self.phone_votes.append(bool(boxes))
-                if y.belt:
-                    r = y.detect_belt(frame, self.cfg.belt_conf)
-                    if r is not None:
-                        self.belt_votes.append(r)
+                if self.pose_model:
+                    cfg = self.cfg
+                    r = self.pose_model(frame, imgsz=cfg.yolo_imgsz, conf=0.4, verbose=False)[0]
+                    if r.keypoints is not None and len(r.boxes) > 0:
+                        xyxy = r.boxes.xyxy.cpu().numpy()
+                        i = int(np.argmax((xyxy[:, 2] - xyxy[:, 0]) * (xyxy[:, 3] - xyxy[:, 1])))
+                        xy = r.keypoints.xy[i].cpu().numpy()
+                        cf = r.keypoints.conf[i].cpu().numpy() if r.keypoints.conf is not None else np.ones(len(xy))
+                        self.pose_kp = np.concatenate([xy, cf[:, None]], axis=1)
+                if self.belt_model:
+                    cfg = self.cfg
+                    results = self.belt_model(frame, imgsz=cfg.yolo_imgsz, verbose=False)[0]
+                    for box in results.boxes:
+                        conf = float(box.conf[0])
+                        if conf >= cfg.belt_conf:
+                            self.belt_votes.append(True)
+                            break
+                    else:
+                        self.belt_votes.append(False)
             except Exception as exc:
                 self.error = repr(exc)
             time.sleep(max(0.0, 1 / max_fps - (time.time() - t0)))
@@ -313,13 +360,19 @@ class MonitorEngine:
         blocked = bool(small.mean() < 15 or small.std() < 6)     # covered or blacked-out lens
         face = ear = roi = None
         if self.face_mesh and not blocked:
-            res = self.face_mesh.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-            if res.multi_face_landmarks:
-                pts = np.array([(p.x * w, p.y * h) for p in res.multi_face_landmarks[0].landmark])
-                face = (*pts.min(0), *pts.max(0))
-                ear = (_ear(pts, R_EYE) + _ear(pts, L_EYE)) / 2
+            if hasattr(self.face_mesh, "detect"):
+                det = self.face_mesh.detect(frame)
+                if det is not None:
+                    face, ear = det
+            elif hasattr(self.face_mesh, "process"):
+                res = self.face_mesh.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                if res and getattr(res, "multi_face_landmarks", None):
+                    pts = np.array([(p.x * w, p.y * h) for p in res.multi_face_landmarks[0].landmark])
+                    face = (*pts.min(0), *pts.max(0))
+                    ear = (_ear(pts, R_EYE) + _ear(pts, L_EYE)) / 2
 
         # seatbelt (heuristic path; the custom model votes from the YOLO thread)
+        kp = getattr(self, "pose_kp", None)
         if not self.belt_model:
             if kp is not None:
                 if self._analysed % 2 == 0:
@@ -351,12 +404,13 @@ class MonitorEngine:
         perclos = sum(c for _, c in hist) / len(hist) if hist and now - hist[0][0] >= 20 else 0.0
         drowsy = closed or (perclos > cfg.perclos_limit and ear is not None and ear < cfg.ear_threshold * 1.15)
 
-        # phone
+        # phone — filter boxes to driver-side area when face is known
         raw = list(self.phone_boxes)
         phones = phones_near_driver(raw, kp, face) if cfg.phone_near_driver else raw
-        if phones and sum(self.phone_votes) >= 2:
+        if phones:
             self.phone_hit = now
 
+        driver_seen = face is not None or kp is not None
         speed = self.speed_src.read(cfg)
         moving = speed >= cfg.min_speed_checks
         flags = {
@@ -368,7 +422,7 @@ class MonitorEngine:
         }
         with self.lock:
             self.speed, self.ear, self.moving, self.perclos = speed, ear, moving, perclos
-            self.driver = face is not None or kp is not None
+            self.driver = driver_seen
             self.overlay = {"face": face, "roi": roi, "phones": phones, "kp": kp}
         self._apply(flags, now)
 
@@ -404,7 +458,7 @@ class MonitorEngine:
         if not (cfg.voice_enabled and p in cfg.voice_params and (first or ev in ("critical", "repeat"))):
             return
         n = self._voice_n[p] = self._voice_n[p] + 1
-        msg = voice_message(p, n, sec=self.trackers[p].duration(now), speed=self.speed, limit=cfg.speed_limit)
+        msg = phone_message(n, self.trackers[p].duration(now)) if p == "phone" else None
         if msg:
             self.voice.say(msg)
             self._log(TITLES[p], f"Voice warning {n}" + ("" if self.voice.available else " (muted: no speech engine found)"))
@@ -455,16 +509,18 @@ class MonitorEngine:
         return f
 
     def snapshot(self) -> dict:
-            params = {p: dict(level=t.level, duration=t.duration(now), limit=self.cfg.critical_after[p],
-                              total=t.total, episodes=t.episodes, criticals=t.criticals)
-                      for p, t in self.trackers.items()}
-            return dict(params=params, speed=self.speed, ear=self.ear, driver=self.driver,
-                        moving=self.moving, perclos=self.perclos, calibrating=bool(self.calib_until),
-                        threshold=self.cfg.ear_threshold, models=dict(self.models), fps=self.fps,
-                        critical_seq=self.critical_seq, error=self.error,
-                        camera_ok=bool(cam and cam.ok and now - cam.last_ts < STALE_AFTER),
-                        events=list(self.events)[::-1],
-                        next_report=max(0.0, self.cfg.log_interval - (now - self.window_start)))
+        now = self._now
+        cam = self.cam
+        params = {p: dict(level=t.level, duration=t.duration(now), limit=self.cfg.critical_after[p],
+                          total=t.total, episodes=t.episodes, criticals=t.criticals)
+                  for p, t in self.trackers.items()}
+        return dict(params=params, speed=self.speed, ear=self.ear, driver=self.driver,
+                    moving=self.moving, perclos=self.perclos, calibrating=bool(self.calib_until),
+                    threshold=self.cfg.ear_threshold, models=dict(self.models), fps=self.fps,
+                    critical_seq=self.critical_seq, error=self.error,
+                    camera_ok=bool(cam and cam.ok and now - cam.last_ts < STALE_AFTER),
+                    events=list(self.events)[::-1],
+                    next_report=max(0.0, self.cfg.log_interval - (now - self.window_start)))
 
     #  driver context and emergency notification 
     def set_driver(self, user: dict | None):
@@ -544,7 +600,7 @@ class MonitorEngine:
             self._notify_speed(raw)
 
     def write_report(self) -> str:
-         with self.lock:
+        with self.lock:
             end, start = time.time(), self.window_start
             win = max(end - start, 1e-6)
             seconds = {TITLES[p]: t.total for p, t in self.trackers.items()}

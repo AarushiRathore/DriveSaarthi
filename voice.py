@@ -1,8 +1,11 @@
-"""Spoken warnings through offline text-to-speech (pyttsx3) on the in-vehicle machine. Never blocks the monitor."""
+
 from __future__ import annotations
 
-import importlib.util
+import os
+import platform
 import queue
+import shutil
+import subprocess
 import threading
 
 PHONE_STAGES = [
@@ -13,69 +16,133 @@ PHONE_STAGES = [
     {"en": "Phone use has continued for {sec} seconds. Please slow down and stop at the next safe place.",
      "hi": "फ़ोन का इस्तेमाल {sec} सेकंड से जारी है। कृपया गाड़ी धीमी करें और अगली सुरक्षित जगह पर रोक लें।"},
 ]
+SPEED_STAGES = [
+    {"en": "You are over the speed limit. Please slow down.",
+     "hi": "आप गति सीमा से ऊपर हैं। कृपया गाड़ी धीमी करें।"},
+    {"en": "You are still driving at {speed} kilometres per hour, above the limit of {limit}. Please reduce your speed now.",
+     "hi": "आप अभी भी {speed} किलोमीटर प्रति घंटे की रफ़्तार पर हैं, जो सीमा {limit} से ज़्यादा है। कृपया अभी गति कम करें।"},
+    {"en": "You have been over the speed limit for {sec} seconds. Please slow down and keep a safe distance.",
+     "hi": "आप {sec} सेकंड से गति सीमा से ऊपर चल रहे हैं। कृपया गाड़ी धीमी करें और सुरक्षित दूरी बनाए रखें।"},
+]
+STAGES = {"phone": PHONE_STAGES, "speed": SPEED_STAGES}
 
 
-def phone_message(stage: int, seconds: float) -> dict:
-    """Wording escalates with each warning the driver ignores."""
-    m = PHONE_STAGES[min(max(stage, 1), len(PHONE_STAGES)) - 1]
-    return {k: v.format(sec=int(seconds)) for k, v in m.items()}
+def message(param: str, stage: int, sec: float = 0, speed: float = 0, limit: float = 0) -> dict | None:
+    """Wording that escalates with each warning the driver ignores. None if this parameter has no voice text."""
+    table = STAGES.get(param)
+    if not table:
+        return None
+    m = table[min(max(stage, 1), len(table)) - 1]
+    return {k: v.format(sec=int(sec), speed=int(round(speed)), limit=int(round(limit))) for k, v in m.items()}
+
+
+def phone_message(stage: int, seconds: float) -> dict:         # kept for older callers
+    return message("phone", stage, sec=seconds)
+
+
+_PS = ("Add-Type -AssemblyName System.Speech; $s = New-Object System.Speech.Synthesis.SpeechSynthesizer; "
+       "$t = $env:VOICE_EN; if ($env:VOICE_HI_WANTED -eq '1') { "
+       "$v = $s.GetInstalledVoices() | Where-Object { $_.VoiceInfo.Culture.Name -like 'hi*' } | Select-Object -First 1; "
+       "if ($v) { $s.SelectVoice($v.VoiceInfo.Name); $t = $env:VOICE_HI } }; $s.Speak($t)")
+
+
+def _run(cmd, env=None):
+    kw = {"creationflags": 0x08000000} if platform.system() == "Windows" else {}      # no console window
+    subprocess.run(cmd, env=env, timeout=45, check=True, capture_output=True, **kw)
+
+
+def _os_speak(texts: dict, want_hindi: bool):
+    system = platform.system()
+    if system == "Windows":
+        env = {**os.environ, "VOICE_EN": texts["en"], "VOICE_HI": texts["hi"], "VOICE_HI_WANTED": "1" if want_hindi else "0"}
+        return _run(["powershell", "-NoProfile", "-NonInteractive", "-Command", _PS], env)
+    if system == "Darwin":
+        hi = want_hindi and "Lekha" in subprocess.run(["say", "-v", "?"], capture_output=True, text=True).stdout
+        return _run(["say", *(["-v", "Lekha"] if hi else []), texts["hi"] if hi else texts["en"]])
+    for tool in ("espeak-ng", "espeak"):
+        if shutil.which(tool):
+            hi = want_hindi and len(subprocess.run([tool, "--voices=hi"], capture_output=True, text=True).stdout.splitlines()) > 1
+            return _run([tool, "-v", "hi" if hi else "en", texts["hi"] if hi else texts["en"]])
+    if shutil.which("spd-say"):
+        return _run(["spd-say", "-w", texts["en"]])
+    raise RuntimeError("no speech tool found (install espeak-ng)")
+
+
+def _pyttsx3_speak(texts: dict, want_hindi: bool):
+    import pyttsx3
+    eng = pyttsx3.init()                           # a fresh engine each time avoids the "speaks only once" bug
+    text = texts["en"]
+    if want_hindi:
+        for v in eng.getProperty("voices"):
+            langs = [(l.decode(errors="ignore") if isinstance(l, bytes) else str(l)).lower() for l in v.languages]
+            if "hindi" in v.name.lower() or any(l.startswith("hi") for l in langs):
+                eng.setProperty("voice", v.id)
+                text = texts["hi"]
+                break
+    eng.say(text)
+    eng.runAndWait()
+    eng.stop()
 
 
 class VoiceAlert:
-    """say() returns immediately; a worker thread speaks. One message may wait, extras are dropped."""
-
     def __init__(self, lang=lambda: "en", speaker=None, sync: bool = False):
         self.lang, self.speaker, self.sync = lang, speaker, sync
         self.history: list[str] = []
+        self.last_error = ""
         self._q: queue.Queue = queue.Queue(maxsize=1)
-        self._worker_started = False
+        self._started = False
 
     @property
     def available(self) -> bool:
-        return self.speaker is not None or importlib.util.find_spec("pyttsx3") is not None
+        if self.speaker is not None:
+            return True
+        system = platform.system()
+        if system == "Windows":
+            return shutil.which("powershell") is not None
+        if system == "Darwin":
+            return shutil.which("say") is not None
+        return any(shutil.which(t) for t in ("espeak-ng", "espeak", "spd-say")) or _has_pyttsx3()
 
     def say(self, texts: dict) -> bool:
         if self.sync:
-            return self._speak(texts, None, None, None)
+            return self._speak(texts)
         try:
             self._q.put_nowait(texts)
         except queue.Full:
             return False
-        if not self._worker_started:
-            self._worker_started = True
+        if not self._started:
+            self._started = True
             threading.Thread(target=self._worker, daemon=True, name="voice").start()
         return True
 
-    def _worker(self):
-        eng = en_id = hi_id = None
-        if self.speaker is None:
-            try:
-                import pyttsx3
-                eng = pyttsx3.init()
-                en_id = eng.getProperty("voice")
-                for v in eng.getProperty("voices"):
-                    langs = [(l.decode(errors="ignore") if isinstance(l, bytes) else str(l)).lower() for l in v.languages]
-                    if "hindi" in v.name.lower() or any(l.startswith("hi") for l in langs):
-                        hi_id = v.id
-                        break
-            except Exception:
-                eng = None
-        while True:
-            self._speak(self._q.get(), eng, en_id, hi_id)
+    def test(self) -> bool:
+        """Blocking check you can run from a button or `python diagnose.py --speak`."""
+        return self._speak({"en": "Voice warnings are working.", "hi": "आवाज़ चेतावनी काम कर रही है।"})
 
-    def _speak(self, texts, eng, en_id, hi_id) -> bool:
-        use_hi = self.lang() == "hi" and (self.speaker is not None or hi_id is not None)
-        text = texts["hi"] if use_hi else texts["en"]
-        self.history.append(text)
+    def _worker(self):
+        while True:
+            self._speak(self._q.get())
+
+    def _speak(self, texts: dict) -> bool:
+        want_hi = self.lang() == "hi"
+        self.history.append(texts["hi"] if want_hi and self.speaker else texts["en"])
         try:
             if self.speaker:
-                self.speaker(text)
-            elif eng:
-                eng.setProperty("voice", hi_id if use_hi else en_id)
-                eng.say(text)
-                eng.runAndWait()
+                self.speaker(texts["hi"] if want_hi else texts["en"])
             else:
-                return False
-        except Exception:
+                try:
+                    _os_speak(texts, want_hi)
+                except Exception as first:
+                    if not _has_pyttsx3():
+                        raise first
+                    _pyttsx3_speak(texts, want_hi)
+            self.last_error = ""
+            return True
+        except Exception as exc:
+            self.last_error = f"{type(exc).__name__}: {exc}"[:200]
             return False
-        return True
+
+
+def _has_pyttsx3() -> bool:
+    import importlib.util
+    return importlib.util.find_spec("pyttsx3") is not None

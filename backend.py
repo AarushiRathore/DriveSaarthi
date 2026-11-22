@@ -1,13 +1,4 @@
-"""Driver monitoring backend: capture, detection, alert escalation, report logging.
-
-Threads (so video never waits on ML):
-  CameraStream  - grabs frames, auto-reconnects, tags each with a sequence number.
-  _loop         - face landmarks, seatbelt heuristic, alert state machines (~15 Hz).
-  _yolo_loop    - heavy YOLO models (phone / custom seatbelt) on the newest frame only.
-UI calls frame() (annotated newest frame) and snapshot() (state for the dashboard).
-"""
 from __future__ import annotations
-
 import atexit
 import csv
 import os
@@ -17,10 +8,8 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
-
 import cv2
 import numpy as np
-
 import auth
 import reporting
 from notifier import IST, Notifier
@@ -61,7 +50,11 @@ class Config:
     renotify_every: float = 300.0          # re-send the overspeed alert (new duration) while it continues
     max_sms_per_hour: int = 6              # cost and spam guard
     voice_enabled: bool = True             # spoken warnings when a critical alert is ignored
-    voice_params: tuple = ("phone",)       # which alerts speak (others need explicit approval)
+    voice_params: tuple = ("phone", "speed")   # which alerts speak
+    voice_on_raised: tuple = ("speed",)    # speak on the first warning too; others wait until critical
+    phone_conf: float = 0.25               # YOLO phone confidence (lower finds more, may add false alarms)
+    yolo_imgsz: int = 480                  # YOLO input size: smaller is faster, larger finds small phones
+    belt_conf: float = 0.65                # confidence for a custom seatbelt model
     voice_lang: str = "en"                 # "en" or "hi" (Hindi needs an installed Hindi voice)
     critical_after: dict = field(default_factory=lambda: {
         "seatbelt": 15.0, "speed": 20.0, "drowsiness": 4.0, "phone": 8.0, "camera": 10.0})
@@ -70,8 +63,6 @@ class Config:
 
 
 class CameraStream:
-    """Frame grabber thread: newest-frame-only, sequence numbers, auto-reconnect."""
-
     def __init__(self, index: int):
         self.index, self.seq, self.last_ts = index, 0, time.time()  # grace period at startup
         self._frame, self._lock, self._stop = None, threading.Lock(), threading.Event()
@@ -107,7 +98,6 @@ class CameraStream:
         self.cap.release()
 
     def read_new(self, after: int, copy: bool = True):
-        """Return (seq, frame) only if a frame newer than `after` exists, else None."""
         with self._lock:
             if self._frame is None or self.seq == after:
                 return None
@@ -118,8 +108,6 @@ class CameraStream:
 
 
 class SpeedSource:
-    """Placeholder speed feed. Replace read() with OBD-II (python-obd) or GPS data."""
-
     def __init__(self):
         self.v = 60.0
 
@@ -149,6 +137,7 @@ class Tracker:
     def duration(self, now: float) -> float:
         return now - self.start if self.start else 0.0
 
+
     def update(self, bad: bool, now: float, confirm: float, limit: float, realert: float) -> list[str]:
         events = []
         if self.start is not None and self.last is not None:
@@ -177,12 +166,6 @@ class Tracker:
                 self.last_alert = now
                 events.append("repeat")
         return events
-
-
-def _ear(p: np.ndarray, idx: list[int]) -> float:
-    a = p[idx]
-    return (np.linalg.norm(a[1] - a[5]) + np.linalg.norm(a[2] - a[4])) / (2 * np.linalg.norm(a[0] - a[3]) + 1e-6)
-
 
 class MonitorEngine:
     def __init__(self, cfg: Config | None = None):
@@ -307,20 +290,21 @@ class MonitorEngine:
             if not item or item[0] == seen or not (self.yolo or self.belt_model):
                 time.sleep(0.02)
                 continue
-            seen, frame = item
+            seen, frame, t0 = item[0], item[1], time.time()
             try:
-                if self.yolo:
-                    r = self.yolo(frame, classes=[67], conf=0.35, imgsz=320, verbose=False)[0]
-                    self.phone_boxes = r.boxes.xyxy.cpu().numpy().astype(int).tolist()
-                if self.belt_model:
-                    r = self.belt_model(frame, conf=0.4, verbose=False)[0]
-                    names = [r.names[int(c)].lower() for c in r.boxes.cls]
-                    if any(n.startswith("no") for n in names):
-                        self.belt_votes.append(False)
-                    elif any("belt" in n for n in names):
-                        self.belt_votes.append(True)
+                if y.pose:
+                    self.pose_kp, self.pose_ts = y.detect_pose(frame), time.time()
+                if y.phone:
+                    boxes = y.detect_phones(frame, self.cfg.phone_conf, self.cfg.yolo_imgsz)
+                    self.phone_boxes = boxes
+                    self.phone_votes.append(bool(boxes))
+                if y.belt:
+                    r = y.detect_belt(frame, self.cfg.belt_conf)
+                    if r is not None:
+                        self.belt_votes.append(r)
             except Exception as exc:
                 self.error = repr(exc)
+            time.sleep(max(0.0, 1 / max_fps - (time.time() - t0)))
 
     # ---------- analysis ----------
     def _analyse(self, frame: np.ndarray, now: float):
@@ -336,24 +320,26 @@ class MonitorEngine:
                 ear = (_ear(pts, R_EYE) + _ear(pts, L_EYE)) / 2
 
         # seatbelt (heuristic path; the custom model votes from the YOLO thread)
-        CLASS_NAMES = {
-            0: "seatbelt_fastened",
-               1: "seatbelt_unfastened",
-                 }
-        if confidence < 0.65:
-            seatbelt_status = "unknown"
-
-        elif class_name == "seatbelt_fastened":
-             seatbelt_status = "fastened"
-
-        elif class_name == "seatbelt_unfastened":
-             seatbelt_status = "unfastened"
-        else:
-                roi = self.overlay.get("roi")
+        if not self.belt_model:
+            if kp is not None:
+                if self._analysed % 2 == 0:
+                    belt, roi = belt_from_pose(frame, kp)
+                    if belt is not None:
+                        self.belt_votes.append(belt)
+                else:
+                    roi = self.overlay.get("roi")
+            elif face is not None:
+                if self._analysed % 2 == 0:
+                    belt, roi = self._belt(frame, face)
+                    if belt is not None:
+                        self.belt_votes.append(belt)
+                else:
+                    roi = self.overlay.get("roi")
+            else:
+                self.belt_votes.clear()
         self._analysed += 1
         votes = list(self.belt_votes)
-
-        # drowsiness: instantaneous closure plus PERCLOS over the last 60 s
+        # drowsiness
         closed = ear is not None and ear < cfg.ear_threshold
         if ear is not None:
             self.eye_hist.append((now, closed))
@@ -365,28 +351,25 @@ class MonitorEngine:
         perclos = sum(c for _, c in hist) / len(hist) if hist and now - hist[0][0] >= 20 else 0.0
         drowsy = closed or (perclos > cfg.perclos_limit and ear is not None and ear < cfg.ear_threshold * 1.15)
 
-        # phone: keep only detections near the driver, hold briefly to ride out flicker
-        phones = list(self.phone_boxes)
-        if face and cfg.phone_near_driver:
-            cx, fw, fh = (face[0] + face[2]) / 2, face[2] - face[0], face[3] - face[1]
-            phones = [b for b in phones if abs((b[0] + b[2]) / 2 - cx) < 2.0 * fw
-                      and face[1] - 0.5 * fh < (b[1] + b[3]) / 2 < face[3] + 2.5 * fh]
-        if phones:
+        # phone
+        raw = list(self.phone_boxes)
+        phones = phones_near_driver(raw, kp, face) if cfg.phone_near_driver else raw
+        if phones and sum(self.phone_votes) >= 2:
             self.phone_hit = now
 
         speed = self.speed_src.read(cfg)
         moving = speed >= cfg.min_speed_checks
         flags = {
-            "seatbelt": moving and (face is not None or self.belt_model is not None)
-                        and len(votes) >= 5 and sum(votes) / len(votes) < 0.35,
+            "seatbelt": moving and driver_seen and len(votes) >= 5 and sum(votes) / len(votes) < 0.35,
             "speed": speed > cfg.speed_limit,
             "drowsiness": drowsy,
             "phone": moving and now - self.phone_hit < 0.8,
             "camera": blocked,
         }
         with self.lock:
-            self.speed, self.ear, self.driver, self.moving, self.perclos = speed, ear, face is not None, moving, perclos
-            self.overlay = {"face": face, "roi": roi, "phones": phones}
+            self.speed, self.ear, self.moving, self.perclos = speed, ear, moving, perclos
+            self.driver = face is not None or kp is not None
+            self.overlay = {"face": face, "roi": roi, "phones": phones, "kp": kp}
         self._apply(flags, now)
 
     def _hold(self, now: float):
@@ -412,14 +395,19 @@ class MonitorEngine:
                     self._voice_hook(p, ev, now)
 
     def _voice_hook(self, p: str, ev: str, now: float):
-        """Speak when a critical alert is still being ignored; wording escalates each time."""
+        """Speak when an alert is raised (if configured) or still being ignored; wording escalates each time."""
+        cfg = self.cfg
         if ev.startswith("resolved"):
             self._voice_n[p] = 0
-        elif ev in ("critical", "repeat") and self.cfg.voice_enabled and p in self.cfg.voice_params and p == "phone":
-            self._voice_n[p] += 1
-            stage = self._voice_n[p]
-            self.voice.say(phone_message(stage, self.trackers[p].duration(now)))
-            self._log(TITLES[p], f"Voice warning {stage}" + ("" if self.voice.available else " (muted: pyttsx3 not installed)"))
+            return
+        first = ev == "raised" and p in cfg.voice_on_raised
+        if not (cfg.voice_enabled and p in cfg.voice_params and (first or ev in ("critical", "repeat"))):
+            return
+        n = self._voice_n[p] = self._voice_n[p] + 1
+        msg = voice_message(p, n, sec=self.trackers[p].duration(now), speed=self.speed, limit=cfg.speed_limit)
+        if msg:
+            self.voice.say(msg)
+            self._log(TITLES[p], f"Voice warning {n}" + ("" if self.voice.available else " (muted: no speech engine found)"))
 
     def _belt(self, frame, face):
         x0, y0, x1, y1 = face
@@ -440,10 +428,9 @@ class MonitorEngine:
                 if 30 <= ang <= 75 or 105 <= ang <= 150:
                     return True, roi
         return False, roi
-
-    # ---------- output for the UI ----------
+    # output for the UI
     def frame(self):
-        """Newest unseen frame with latest detections drawn on it; None if nothing new."""
+        
         cam = self.cam
         item = cam.read_new(self._ui_seq) if cam else None
         if item is None:
@@ -468,8 +455,6 @@ class MonitorEngine:
         return f
 
     def snapshot(self) -> dict:
-        now, cam = time.time(), self.cam
-        with self.lock:
             params = {p: dict(level=t.level, duration=t.duration(now), limit=self.cfg.critical_after[p],
                               total=t.total, episodes=t.episodes, criticals=t.criticals)
                       for p, t in self.trackers.items()}
@@ -481,9 +466,8 @@ class MonitorEngine:
                         events=list(self.events)[::-1],
                         next_report=max(0.0, self.cfg.log_interval - (now - self.window_start)))
 
-    # ---------- driver context and emergency notification ----------
+    #  driver context and emergency notification 
     def set_driver(self, user: dict | None):
-        """Attach the signed-in driver: reports and logs go to logs/<username>/."""
         prev = self.driver_info
         if prev and (not user or user["id"] != prev["id"]) and self.running:
             self.write_report()                          # close the previous driver's window
@@ -494,7 +478,6 @@ class MonitorEngine:
         self.location = {"lat": lat, "lon": lon, "source": source, "ts": time.time()}
 
     def _where(self) -> str:
-        """Location for an SMS variable: coordinates first. No links, because DLT blocks unlisted URLs."""
         loc, label = self.location, self.location_label.strip()
         parts = []
         if loc:
@@ -517,7 +500,6 @@ class MonitorEngine:
         return True
 
     def _notify_speed(self, raw: str):
-        """Text the emergency contact (DLT templates): on critical, periodically while it continues, and on resolve."""
         info, cfg, now = self.driver_info, self.cfg, self._now
         if not info or not info.get("emergency_phone"):
             return
@@ -541,10 +523,10 @@ class MonitorEngine:
             return
         self._last_sms = now
         self._speed_notified = self._speed_notified or kind == "alert"
-        self.notifier.send(info.get["emergency_email"], kind, vals, cfg.log_dir,
+        self.notifier.send(info["emergency_phone"], kind, vals, cfg.log_dir,
                            lambda st: self._log("Speed", f"Emergency contact notified: {st}"))
 
-    # ---------- logging ----------
+    # logging
     def _log(self, title: str, text: str):
         row = (datetime.now(IST).strftime("%H:%M:%S"), title, text)
         self.events.append(row)
@@ -562,9 +544,7 @@ class MonitorEngine:
             self._notify_speed(raw)
 
     def write_report(self) -> str:
-        """Atomically save this window as CSV plus a pie chart of each factor's share, then start a new window.
-        If the disk write fails, nothing is reset, so no data is lost; the loop retries 30 s later."""
-        with self.lock:
+         with self.lock:
             end, start = time.time(), self.window_start
             win = max(end - start, 1e-6)
             seconds = {TITLES[p]: t.total for p, t in self.trackers.items()}

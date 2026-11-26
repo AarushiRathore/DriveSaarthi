@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+
+# Runtime data & logs
+data/
+logs/
+
+# ML model weights (large binaries – download separately)
+*.pt
+*.task
+models/
+
+# Streamlit
+.streamlit/secrets.toml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temp / editor
+*.tmp
+_*.py
+_*.txt
+.vscode/settings.json

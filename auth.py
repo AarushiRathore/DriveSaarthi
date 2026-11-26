@@ -63,13 +63,14 @@ def _strong(pw: str) -> bool:
 def register(full_name, username, password, emergency_name, emergency_phone,
              vehicle_plate="", license_no="", email="") -> tuple[bool, str]:
     username, phone = username.strip().lower(), clean_phone(emergency_phone)
-    if not full_name.strip() or not emergency_name.strip():
-        return False, "Your name and the emergency contact's name are required."
+    if not full_name.strip():
+        return False, "Your name is required."
     if not USERNAME_RE.match(username):
         return False, "Username must be 3 to 32 characters: letters, digits, dot, dash or underscore."
     if not _strong(password):
         return False, "Password needs at least 8 characters, with letters and digits."
-    if not PHONE_RE.match(phone):
+    # emergency contact is optional — only validate if provided
+    if phone and not PHONE_RE.match(phone):
         return False, "Emergency number needs the country code, for example +919810012345."
     salt = secrets.token_bytes(16)
     try:
